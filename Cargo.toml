@@ -1,0 +1,18 @@
+[package]
+name = "acs_seed_finder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.10.0"
+eframe = "0.27.2"
+wgpu = "29.0.1"
+pollster = "0.3.0"
+bytemuck = { version = "1.15.0", features = ["derive"] }
+rfd = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
