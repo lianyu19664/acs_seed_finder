@@ -1,3 +1,244 @@
+use crate::core::rng::DotNetRandom;
+use std::{collections::HashMap, fs, path::PathBuf};
+
+struct CsDict<K, V> {
+    keys: Vec<K>,
+    pub values: Vec<V>,
+    indices: HashMap<K, usize>,
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V> CsDict<K, V> {
+    fn new() -> Self {
+        Self {
+            keys: vec![],
+            values: vec![],
+            indices: HashMap::new(),
+        }
+    }
+    fn insert(&mut self, k: K, v: V) {
+        if let Some(&i) = self.indices.get(&k) {
+            self.values[i] = v;
+        } else {
+            self.indices.insert(k.clone(), self.keys.len());
+            self.keys.push(k);
+            self.values.push(v);
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct GameData {
+    pub clothes: Vec<String>,
+    pub pants: Vec<String>,
+    pub weapons: Vec<String>,
+    pub stuffs: Vec<String>,
+    pub spells: Vec<String>,
+    pub tools: Vec<String>,
+    pub names_prefix: Vec<String>,
+    pub names_m_suffix: Vec<String>,
+    pub names_f_suffix: Vec<String>,
+    pub loaded: bool,
+}
+
+impl GameData {
+    pub fn load_from_dir(b: &std::path::Path) -> Self {
+        let (mut im, mut sm, mut f) = (CsDict::new(), CsDict::new(), vec![]);
+        fn walk(d: &std::path::Path, f: &mut Vec<PathBuf>) {
+            if let Ok(es) = fs::read_dir(d) {
+                for p in es.flatten().map(|e| e.path()) {
+                    if p.is_dir() {
+                        walk(&p, f);
+                    } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("xml") || e.eq_ignore_ascii_case("txt")) {
+                        f.push(p);
+                    }
+                }
+            }
+        }
+        
+        ["ThingDef", "Practice/Spell", "Language"]
+            .iter()
+            .for_each(|d| walk(&b.join(d), &mut f));
+            
+        f.sort();
+
+        let mut translations: HashMap<String, String> = HashMap::new();
+
+        for p in &f {
+            let path_str = p.to_string_lossy();
+            if path_str.contains("Language") {
+                if let Ok(content) = fs::read_to_string(p) {
+                    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("txt")) {
+                        let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+                        for chunk in lines.chunks(2) {
+                            if chunk.len() == 2 {
+                                translations.insert(chunk[0].to_string(), chunk[1].to_string());
+                            }
+                        }
+                    } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("xml")) {
+                        for line in content.lines() {
+                            if let Some(start) = line.find("Name=\"") {
+                                if let Some(end) = line[start + 6..].find('"') {
+                                    let key = &line[start + 6..start + 6 + end];
+                                    if let Some(val_start) = line.find('>') {
+                                        if let Some(val_end) = line.find("</Text>") {
+                                            if val_start < val_end {
+                                                let val = &line[val_start + 1..val_end];
+                                                translations.insert(key.trim().to_string(), val.trim().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let translate = |s: &str| -> String {
+            translations.get(s).cloned().unwrap_or_else(|| s.to_string())
+        };
+
+        let txt = |b: &str, t: &str| {
+            b.split_once(&format!("<{t}>"))?
+                .1
+                .split_once(&format!("</{t}>"))
+                .map(|(s, _)| s.trim().to_string())
+        };
+        
+        for p in f.into_iter().filter_map(|p| fs::read_to_string(p).ok()) {
+            for b in p
+                .split("</ThingDef>")
+                .filter_map(|s| s.split_once("<ThingDef").map(|(_, b)| b))
+            {
+                let n = txt(b, "defName")
+                    .or_else(|| {
+                        let mut r = b;
+                        while let Some((left, right)) = r.split_once("Name=\"") {
+                            if !left.ends_with("Parent") {
+                                return right.split_once('"').map(|(s, _)| s.to_string());
+                            }
+                            r = right;
+                        }
+                        None
+                    })
+                    .unwrap_or_default();
+                if !n.is_empty() {
+                    let mut et = b
+                        .split_once("Lable=\"")
+                        .and_then(|(_, right)| right.split_once('"'))
+                        .map(|(s, _)| s.trim().to_string())
+                        .unwrap_or_default();
+
+                    if et.is_empty() {
+                        if b.contains("Parent=\"ToolBase\"") || b.contains("Parent=\"Item_Tool\"") {
+                            et = "Tool".to_string();
+                        }
+                    }
+
+                    let raw_tn_opt = txt(b, "ThingName");
+
+                    if n.ends_with("Base") || (raw_tn_opt.is_none() && b.contains("Parent=\"ItemBase\"")) {
+                        continue;
+                    }
+                    
+                    let raw_tn = raw_tn_opt.unwrap_or_else(|| n.clone());
+                    let tn = translate(&raw_tn);
+                    if tn.is_empty() {
+                        continue;
+                    }
+                    
+                    let it = n.clone();
+                    let is_stuff = ["Material", "LeftoverMaterial", "Rock", "WoodBlock", "MetalBlock", "Bone", "BambooBlock", "Stuff", "Wood", "Meat"]
+                                .contains(&et.as_str())
+                                || b.contains("<StuffTexPath")
+                                || b.contains("<StuffCategories>");
+                    im.insert(n, (tn, it, et, is_stuff));
+                }
+            }
+            for b in p
+                .split("</Spell>")
+                .filter_map(|s| s.split_once("<Spell ").map(|(_, b)| b))
+            {
+                let n = txt(b, "defName")
+                    .or_else(|| {
+                        let mut r = b;
+                        while let Some((left, right)) = r.split_once("Name=\"") {
+                            if !left.ends_with("Parent") {
+                                return right.split_once('"').map(|(s, _)| s.to_string());
+                            }
+                            r = right;
+                        }
+                        None
+                    })
+                    .unwrap_or_default();
+                if !n.is_empty() {
+                    let raw_dn = txt(b, "DisplayName")
+                        .or_else(|| txt(b, "ThingName"))
+                        .unwrap_or_else(|| n.clone());
+                    sm.insert(n.clone(), translate(&raw_dn));
+                }
+            }
+        }
+        
+        let mut d = Self::default();
+        for (tn, it, et, is_stuff) in im.values {
+            if et == "Clothes" {
+                d.clothes.push(tn.clone());
+            }
+            if et == "Pants" || et == "Trousers" {
+                d.pants.push(tn.clone());
+            }
+            if et == "Weapon" || it == "Fabao" || it.contains("Fabao") {
+                d.weapons.push(tn.clone());
+            }
+            if et == "Tool" { 
+                d.tools.push(tn.clone());
+            }
+            if is_stuff {
+                d.stuffs.push(tn);
+            }
+        }
+        d.spells = sm.values;
+        d.loaded = !d.clothes.is_empty();
+        
+        let load_names = |file: &str| -> Vec<String> {
+            if let Ok(content) = fs::read_to_string(b.join(file)) {
+                content.split(&['\r', '\n'][..])
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+        d.names_prefix = load_names("Display/NpcName/RaceName/Prefix_Human.txt");
+        d.names_m_suffix = load_names("Display/NpcName/RaceName/MSuffix.txt");
+        d.names_f_suffix = load_names("Display/NpcName/RaceName/FSuffix.txt");
+
+        d
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SectData {
+    pub sect_name: String,
+    pub elders: Vec<ElderData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ElderData {
+    pub name: String,
+    pub level_name: String, 
+    pub talismans: Vec<String>,
+    pub inventory: Vec<String>,
+}
+
+/// 安全的数组访问器，杜绝 panic
+fn get_safe_item(pool: &[String], index: usize) -> String {
+    pool.get(index).cloned().unwrap_or_else(|| format!("未知物品_#{}", index))
+}
+
 /// 核心推演引擎：基于基础世界 Seed 透视 13 门派大能数据
 pub fn extract_all_sect_elders(world_seed: i32, d: &GameData) -> Vec<SectData> {
     let sects = [
@@ -24,7 +265,6 @@ pub fn extract_all_sect_elders(world_seed: i32, d: &GameData) -> Vec<SectData> {
                 // ==========================================
                 let mut prng_a = DotNetRandom::new(base_entity_seed);
                 
-                // 模拟 NpcRandomMechine._RandomNpc 内部的姓名、外貌随机步长。
                 let mut age = 0.0;
                 let mut num = 0;
                 while (age < 14.0 || age > 60.0) && num < 100 {
